@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SugarCube Debugger</title>
+    <style>
+        /* General Layout */
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            overflow: hidden; /* No scrollbars on the body */
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        #main-container {
+            display: flex;
+            height: 100%;
+            width: 100%;
+        }
+
+        /* Left Panel (Game) */
+        #game-panel {
+            width: 80%;
+            height: 100%;
+            position: relative; /* For positioning the overlay */
+            background-color: #333; /* Dark background for the game area */
+        }
+
+        #game-iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+
+        /* Import Overlay */
+        #import-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            z-index: 10;
+        }
+        
+        #import-overlay.hidden {
+            display: none;
+        }
+
+        #import-overlay h2 {
+            margin-bottom: 20px;
+        }
+
+        /* Right Panel (Debugger) */
+        #debugger-panel {
+            width: 20%;
+            min-width: 300px;
+            height: 100%;
+            background-color: #f0f0f0; /* Light gray background */
+            box-shadow: -4px 0 6px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box; /* Include padding in width */
+        }
+        
+        .debugger-header {
+            padding: 20px 20px 0 20px;
+        }
+
+        .debugger-content {
+            padding: 0 20px 20px 20px;
+            overflow-y: auto; /* Allow scrolling within the debugger if needed */
+            flex-grow: 1;
+        }
+
+        h1 { margin-top: 0; font-size: 1.25rem; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+        
+        .status-bar {
+            padding: 10px;
+            background: #e9ecef;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            font-family: monospace;
+        }
+
+        #filter-input {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 15px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+
+        /* Variable Tree Styles */
+        #variables-container {
+            font-family: monospace;
+            font-size: 0.85rem;
+            line-height: 1.6;
+        }
+        .variable-item {
+            padding-left: 15px;
+            position: relative;
+        }
+        .variable-item.collapsible > .variable-key::before {
+            content: '▶';
+            position: absolute;
+            left: 0;
+            cursor: pointer;
+            font-size: 0.75rem;
+            transform: translateY(3px);
+        }
+        .variable-item.collapsible.expanded > .variable-key::before {
+            content: '▼';
+        }
+        .variable-key {
+            font-weight: bold;
+            color: #4a4a4a;
+        }
+        .variable-value-input {
+            width: 60%;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            background-color: #fff;
+            font-family: monospace;
+        }
+        .variable-item.filtered-out {
+            display: none;
+        }
+        .variable-value-container {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .freeze-btn {
+            padding: 2px 5px;
+            font-size: 0.7rem;
+            border: 1px solid #aaa;
+            border-radius: 3px;
+            cursor: pointer;
+            background-color: #eee;
+        }
+        .freeze-btn.frozen {
+            background-color: #add8e6;
+            border-color: #8abac0
+        }
+        .variable-children {
+            display: none;
+        }
+        .variable-item.expanded > .variable-children {
+            display: block;
+        }
+        @keyframes flash {
+            0% { background-color: yellow; }
+            100% { background-color: transparent; }
+        }
+    </style>
+</head>
+<body>
+    <div id="main-container">
+        <!-- Left panel for the game -->
+        <div id="game-panel">
+            <div id="import-overlay">
+                <h2>Import SugarCube Game</h2>
+                <input type="file" id="file-input" accept=".html">
+            </div>
+            <iframe id="game-iframe" srcdoc=""></iframe>
+        </div>
+
+        <!-- Right panel for the debugger UI -->
+        <div id="debugger-panel">
+            <div class="debugger-header">
+                <h1>SugarCube Debugger</h1>
+                <div class="status-bar" id="status">Waiting for game...</div>
+                <input type="text" id="filter-input" placeholder="Filter variables...">
+            </div>
+            <div class="debugger-content">
+                <div id="variables-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const fileInput = document.getElementById('file-input');
+            const filterInput = document.getElementById('filter-input');
+            const importOverlay = document.getElementById('import-overlay');
+            const gameIframe = document.getElementById('game-iframe');
+            const status = document.getElementById('status');
+            const variablesContainer = document.getElementById('variables-container');
+
+            let scState = null;
+            let previousState = {};
+            let frozenVariables = {};
+            let debuggerInterval = null;
+            let connectionInterval = null;
+
+            fileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    gameIframe.srcdoc = e.target.result;
+                    importOverlay.classList.add('hidden');
+                    frozenVariables = {}; // Reset on new file load
+                    
+                    if (connectionInterval) clearInterval(connectionInterval);
+                    connectionInterval = setInterval(establishConnection, 500);
+                };
+                reader.onerror = () => {
+                    status.textContent = 'Error reading file.';
+                    status.style.background = '#f8d7da';
+                    status.style.color = '#721c24';
+                };
+                reader.readAsText(file);
+            });
+            
+            filterInput.addEventListener('input', () => {
+                const filterText = filterInput.value.toLowerCase();
+                const topLevelItems = variablesContainer.querySelectorAll(':scope > .variable-item');
+                topLevelItems.forEach(item => filterTree(item, filterText));
+            });
+
+            function establishConnection() {
+                const iframeWindow = gameIframe.contentWindow;
+                if (iframeWindow && iframeWindow.SugarCube && iframeWindow.SugarCube.State) {
+                    clearInterval(connectionInterval);
+                    connectionInterval = null;
+                    
+                    scState = iframeWindow.SugarCube.State;
+                    status.textContent = `Connected: SugarCube v${iframeWindow.SugarCube.version.version || 'unknown'}`;
+                    status.style.background = '#d4edda';
+                    status.style.color = '#155724';
+
+                    if (debuggerInterval) clearInterval(debuggerInterval);
+                    debuggerInterval = setInterval(updateDebugger, 200);
+                }
+            }
+
+            function enforceFrozenVariables() {
+                if (Object.keys(frozenVariables).length === 0) return;
+                for (const [pathString, frozenValue] of Object.entries(frozenVariables)) {
+                    updateLiveVariable(pathString.split('.'), frozenValue);
+                }
+            }
+            
+            function updateLiveVariable(path, value) {
+                if (!scState || !scState.active) return;
+                let current = scState.active.variables;
+                for (let i = 0; i < path.length - 1; i++) {
+                    if (current[path[i]] === undefined) return; // Path no longer exists
+                    current = current[path[i]];
+                }
+                current[path[path.length - 1]] = value;
+            }
+
+            function updateDebugger() {
+                if (!scState || !scState.active) return;
+                
+                enforceFrozenVariables();
+                
+                const currentState = scState.active.variables;
+                renderVariables(variablesContainer, currentState, previousState, []);
+                previousState = JSON.parse(JSON.stringify(currentState));
+            }
+
+            function renderVariables(parentEl, current, previous, path) {
+                const allKeys = new Set([...Object.keys(current || {}), ...Object.keys(previous || {})]);
+
+                for (const key of allKeys) {
+                    const currentValue = current ? current[key] : undefined;
+                    const previousValue = previous ? previous[key] : undefined;
+                    const currentPath = path.concat(key);
+                    const pathString = currentPath.join('.');
+                    let itemEl = parentEl.querySelector(`:scope > [data-key="${key}"]`);
+
+                    if (currentValue === undefined) {
+                        if (itemEl) {
+                           delete frozenVariables[pathString];
+                           itemEl.remove();
+                        }
+                        continue;
+                    }
+
+                    const isObject = typeof currentValue === 'object' && currentValue !== null;
+
+                    if (itemEl === null) {
+                        itemEl = document.createElement('div');
+                        itemEl.dataset.key = key;
+                        itemEl.className = 'variable-item';
+                        if (isObject) itemEl.classList.add('collapsible', 'expanded');
+
+                        const keyEl = document.createElement('span');
+                        keyEl.className = 'variable-key';
+                        keyEl.textContent = `${key}: `;
+                        itemEl.appendChild(keyEl);
+                        
+                        if (isObject) {
+                            keyEl.onclick = () => itemEl.classList.toggle('expanded');
+                            const childrenEl = document.createElement('div');
+                            childrenEl.className = 'variable-children';
+                            itemEl.appendChild(childrenEl);
+                        } else {
+                            itemEl.appendChild(createValueInput(currentValue, currentPath));
+                        }
+                        parentEl.appendChild(itemEl);
+                    }
+
+                    if (isObject) {
+                        const childrenEl = itemEl.querySelector('.variable-children');
+                        renderVariables(childrenEl, currentValue, previousValue || {}, currentPath);
+                    } else {
+                        const inputEl = itemEl.querySelector('.variable-value-input');
+                        if (JSON.stringify(currentValue) !== JSON.stringify(previousValue) && document.activeElement !== inputEl) {
+                            if (inputEl.type === 'checkbox') {
+                                inputEl.checked = currentValue;
+                            } else {
+                                inputEl.value = currentValue;
+                            }
+                            inputEl.classList.add('updated');
+                            inputEl.onanimationend = () => inputEl.classList.remove('updated');
+                        }
+                    }
+                }
+            }
+
+            function createValueInput(value, path) {
+                const container = document.createElement('span');
+                container.className = 'variable-value-container';
+
+                const input = document.createElement('input');
+                input.className = 'variable-value-input';
+                const type = typeof value;
+
+                if (type === 'boolean') {
+                    input.type = 'checkbox';
+                    input.checked = value;
+                    input.addEventListener('change', () => updateLiveVariable(path, input.checked));
+                } else {
+                    input.type = type === 'number' ? 'number' : 'text';
+                    input.value = value;
+                    input.addEventListener('change', () => {
+                        const newValue = type === 'number' ? Number(input.value) : input.value;
+                        updateLiveVariable(path, newValue);
+                    });
+                }
+
+                const freezeBtn = document.createElement('button');
+                freezeBtn.className = 'freeze-btn';
+                const pathString = path.join('.');
+                
+                if (frozenVariables[pathString] !== undefined) {
+                    freezeBtn.textContent = 'Unfreeze';
+                    freezeBtn.classList.add('frozen');
+                } else {
+                    freezeBtn.textContent = 'Freeze';
+                }
+
+                freezeBtn.addEventListener('click', () => {
+                    if (frozenVariables[pathString] !== undefined) {
+                        // Unfreeze
+                        delete frozenVariables[pathString];
+                        freezeBtn.textContent = 'Freeze';
+                        freezeBtn.classList.remove('frozen');
+                    } else {
+                        // Freeze
+                        const currentValue = type === 'boolean' ? input.checked : (type === 'number' ? Number(input.value) : input.value);
+                        frozenVariables[pathString] = currentValue;
+                        freezeBtn.textContent = 'Unfreeze';
+                        freezeBtn.classList.add('frozen');
+                    }
+                });
+                
+                container.appendChild(input);
+                container.appendChild(freezeBtn);
+                return container;
+            }
+            
+            function filterTree(element, filterText) {
+                const key = element.dataset.key.toLowerCase();
+                const isObject = element.classList.contains('collapsible');
+                let hasVisibleChild = false;
+
+                if (isObject) {
+                    const children = element.querySelector('.variable-children').querySelectorAll(':scope > .variable-item');
+                    children.forEach(child => {
+                        if (filterTree(child, filterText)) {
+                            hasVisibleChild = true;
+                        }
+                    });
+                }
+                
+                const isMatch = key.includes(filterText) || hasVisibleChild;
+                element.classList.toggle('filtered-out', !isMatch);
+                if (isMatch && isObject) element.classList.add('expanded');
+                
+                return isMatch;
+            }
+        });
+    </script>
+</body>
+</html>
